@@ -27,6 +27,15 @@ class LangChainSQLApp:
         """
         Initialize the LangChain SQL application.
         """
+
+        radio_opt = [
+            "Use SQLite 3 Database - test.db",
+            "Connect to your SQL database",
+            "Connect to your Astra database"
+        ]
+        selected_opt = st.sidebar.radio(label="Choose your database", options=radio_opt)
+
+
         if not os.path.exists(db_path):
             raise FileNotFoundError(f"Database file not found: {db_path}")
 

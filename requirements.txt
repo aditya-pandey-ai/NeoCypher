@@ -8,3 +8,12 @@ langchain~=0.2.16
 SQLAlchemy~=2.0.34
 mysql-connector-python
 pymongo
+openai
+python-dotenv
+neo4j==5.14
+langchain-community
+langchain-groq
+cassio
+langchain_openai
+plotly
+

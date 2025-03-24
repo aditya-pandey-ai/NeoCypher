@@ -1,5 +1,3 @@
-## Redacted
-
 import streamlit as st
 from langchain_groq import ChatGroq
 from langchain.agents import initialize_agent, AgentType, Tool

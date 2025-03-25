@@ -11,13 +11,13 @@ from dotenv import load_dotenv
 import os
 import asyncio
 from functools import wraps
-import pymongo
-import psycopg2
-from pymongo import MongoClient
-from psycopg2.extras import RealDictCursor
+from sqlalchemy import create_engine,text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
-import certifi
+import psycopg2
+from psycopg2 import pool
 
 def async_handler(func):
     @wraps(func)
@@ -186,32 +186,57 @@ class SQLiteConnector(DatabaseConnector):
             raise Exception(f"Error getting table info: {str(e)}")
 
 
-class PostgreSQLConnector(DatabaseConnector):
-    """PostgreSQL database connector for Neon DB"""
+class NeonPostgresConnector(DatabaseConnector):
+    """Enhanced Neon PostgreSQL database connector with comprehensive CRUD support"""
 
     def __init__(self, connection_string: str):
         super().__init__()
         self.connection_string = connection_string
-        self.db = None
+        self.connection_pool = None
+        self.engine = None
+        self.SessionLocal = None
 
     def connect(self):
-        """Connect to PostgreSQL database"""
+        """Connect to Neon PostgreSQL database with connection pooling"""
         try:
-            self.connection = psycopg2.connect(self.connection_string)
-            # Verify connection works
-            cursor = self.connection.cursor()
-            cursor.execute("SELECT 1")
-            cursor.close()
+            print("Connecting to Neon PostgreSQL...")
 
-            self.db = SQLDatabase.from_uri(self.connection_string)
+            # Create SQLAlchemy engine with connection pooling
+            self.engine = create_engine(
+                self.connection_string,
+                pool_size=10,  # Adjust based on your needs
+                max_overflow=20,
+                pool_pre_ping=True,
+                pool_recycle=3600  # Recycle connections after 1 hour
+            )
+
+            # Create session factory
+            self.SessionLocal = sessionmaker(bind=self.engine)
+
+            # Create psycopg2 connection pool
+            self.connection_pool = psycopg2.pool.SimpleConnectionPool(
+                1,  # Minimum connections
+                20,  # Maximum connections
+                self.connection_string
+            )
+
+            # Verify connection
+            with self.engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+
+            print("Connected to Neon PostgreSQL successfully!")
             return True
+
         except Exception as e:
-            raise Exception(f"Failed to initialize PostgreSQL connection: {str(e)}")
+            print(f"Neon PostgreSQL Connection Error: {e}")
+            raise Exception(f"Failed to initialize Neon PostgreSQL connection: {str(e)}")
 
     def disconnect(self):
-        """Close the PostgreSQL connection"""
-        if self.connection:
-            self.connection.close()
+        """Close database connections"""
+        if self.connection_pool:
+            self.connection_pool.closeall()
+        if self.engine:
+            self.engine.dispose()
 
     def execute_query(self, query: str) -> pd.DataFrame:
         """Execute PostgreSQL query and return results as DataFrame"""
@@ -219,51 +244,47 @@ class PostgreSQLConnector(DatabaseConnector):
             raise ValueError("SQL query cannot be empty")
 
         try:
-            # Split into individual statements
-            statements = self._split_sql_statements(query)
-            if not statements:
-                raise ValueError("No valid SQL statements found")
+            # Get a connection from the pool
+            conn = self.connection_pool.getconn()
 
             try:
-                # Start a transaction
-                self.connection.autocommit = False
+                # Create cursor
+                with conn.cursor() as cursor:
+                    # Split queries to handle multiple statements
+                    statements = self._split_sql_statements(query)
 
-                # Execute all non-SELECT statements first
-                cursor = self.connection.cursor()
-                for stmt in statements[:-1]:  # All but the last statement
-                    if stmt.strip().upper().startswith('SELECT'):
-                        continue  # Skip SELECT statements except the last one
-                    cursor.execute(stmt)
+                    # Execute all statements except the last one
+                    for stmt in statements[:-1]:
+                        cursor.execute(stmt)
 
-                # Execute the final statement and return results
-                final_stmt = statements[-1]
-                if not final_stmt.strip().upper().startswith('SELECT'):
-                    # If last statement isn't a SELECT, execute it and return empty DataFrame
-                    cursor.execute(final_stmt)
-                    self.connection.commit()
-                    return pd.DataFrame()
+                    # Execute the last statement (typically a SELECT)
+                    last_stmt = statements[-1]
+                    cursor.execute(last_stmt)
 
-                # Return results of the final SELECT statement
-                cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-                cursor.execute(final_stmt)
-                results = cursor.fetchall()
-                self.connection.commit()
+                    # Fetch results
+                    columns = [desc[0] for desc in cursor.description]
+                    results = cursor.fetchall()
 
-                # Convert to DataFrame
-                if results:
-                    df = pd.DataFrame(results)
+                    # Commit transaction
+                    conn.commit()
+
+                    # Convert to DataFrame
+                    df = pd.DataFrame(results, columns=columns)
                     return df
-                return pd.DataFrame()
 
-            except Exception as e:
-                self.connection.rollback()
-                raise
+            except Exception as query_error:
+                conn.rollback()
+                raise query_error
+            finally:
+                # Always return connection to the pool
+                self.connection_pool.putconn(conn)
+
         except Exception as e:
             raise Exception(f"Error executing PostgreSQL query: {str(e)}")
 
     def _split_sql_statements(self, query: str) -> List[str]:
         """Split multiple SQL statements into a list of individual statements."""
-        # Split on semicolon but ignore semicolons inside quotes
+        # Similar implementation to SQLite method in previous code
         statements = []
         current_statement = []
         in_quotes = False
@@ -290,51 +311,88 @@ class PostgreSQLConnector(DatabaseConnector):
         return [stmt for stmt in statements if stmt]
 
     def get_schema_info(self) -> str:
-        """Get PostgreSQL schema information"""
-        return self.db.get_table_info()
+        """Get comprehensive PostgreSQL schema information"""
+        try:
+            with self.engine.connect() as connection:
+                # Query to get table and column information
+                schema_query = """
+                SELECT 
+                    table_schema, 
+                    table_name, 
+                    column_name, 
+                    data_type,
+                    character_maximum_length,
+                    is_nullable
+                FROM 
+                    information_schema.columns
+                WHERE 
+                    table_schema NOT IN ('pg_catalog', 'information_schema')
+                ORDER BY 
+                    table_schema, table_name, ordinal_position
+                """
+
+                result = connection.execute(text(schema_query))
+
+                schema_info = "PostgreSQL Database Schema:\n"
+                current_table = None
+
+                for row in result:
+                    if current_table != row.table_name:
+                        schema_info += f"\nTable: {row.table_name}\n"
+                        current_table = row.table_name
+
+                    # Format column details
+                    column_type = row.data_type
+                    if row.character_maximum_length:
+                        column_type += f"({row.character_maximum_length})"
+
+                    schema_info += (
+                        f"  - {row.column_name}: {column_type} "
+                        f"{'NOT NULL' if row.is_nullable == 'NO' else 'NULLABLE'}\n"
+                    )
+
+                return schema_info
+
+        except Exception as e:
+            return f"Error retrieving PostgreSQL schema: {str(e)}"
 
     def get_table_info(self) -> Dict[str, Any]:
         """Get information about PostgreSQL tables and their schemas."""
         tables = {}
         try:
-            cursor = self.connection.cursor()
-
-            # Get table names
-            cursor.execute("""
-                SELECT table_name FROM information_schema.tables 
-                WHERE table_schema = 'public';
-            """)
-
-            table_names = cursor.fetchall()
-            if not table_names:
-                raise ValueError("No tables found in database")
-
-            for (table_name,) in table_names:
-                # Get column information
-                cursor.execute(f"""
-                    SELECT column_name, data_type 
-                    FROM information_schema.columns 
-                    WHERE table_name = '{table_name}';
+            with self.engine.connect() as connection:
+                # Get table names
+                table_query = text("""
+                    SELECT table_name 
+                    FROM information_schema.tables 
+                    WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
                 """)
+                table_names = connection.execute(table_query).fetchall()
 
-                columns = cursor.fetchall()
-                if not columns:
-                    continue
+                for (table_name,) in table_names:
+                    # Get column information
+                    column_query = text(f"""
+                        SELECT column_name, data_type 
+                        FROM information_schema.columns 
+                        WHERE table_name = :table_name
+                    """)
+                    columns = connection.execute(column_query, {'table_name': table_name}).fetchall()
+                    column_names = [col[0] for col in columns]
 
-                # Get sample data
-                cursor.execute(f"SELECT * FROM {table_name} LIMIT 5;")
-                sample_data = cursor.fetchall()
+                    # Fetch sample data
+                    sample_query = text(f"SELECT * FROM {table_name} LIMIT 5")
+                    sample_data = connection.execute(sample_query).fetchall()
 
-                tables[table_name] = {
-                    'columns': [col[0] for col in columns],
-                    'sample_data': sample_data if sample_data else []
-                }
+                    tables[table_name] = {
+                        'columns': column_names,
+                        'sample_data': sample_data
+                    }
 
             return tables
+
         except Exception as e:
-            raise Exception(f"Error getting PostgreSQL table info: {str(e)}")
-
-
+            print(f"Error getting PostgreSQL table info: {e}")
+            return {"error": str(e)}
 class MongoDBConnector(DatabaseConnector):
     """MongoDB Atlas connector"""
 
@@ -552,28 +610,27 @@ class LangChainDBApp:
 
     def _create_query_chain(self):
         """Create the query generation chain with custom prompt."""
-        if isinstance(self.connector, SQLiteConnector) or isinstance(self.connector, PostgreSQLConnector):
+        if isinstance(self.connector, SQLiteConnector) or isinstance(self.connector, NeonPostgresConnector):
             # SQL-based prompt
             prompt = PromptTemplate.from_template("""
-               Given the following database schema:
-               {schema}
+                       Given the following PostgreSQL database schema:
+            {schema}
 
-               Generate a SQL query to answer this question:
-               {question}
+            Generate a PostgreSQL SQL query to answer this question:
+            {question}
 
-               Rules:
-               1. Use only tables and columns that exist in the schema
-               2. Use syntax appropriate for {db_type}
-               3. Ensure the query is optimized and efficient
-               4. Return only the SQL query without any markdown formatting or explanation
-               5. Do not wrap the query in code blocks
-               6. If you need to modify data (UPDATE/INSERT/DELETE), always include a SELECT statement afterward to show the results
-               7. Each statement must end with a semicolon
+            Important Rules:
+            1. Use only tables and columns that exist in the schema
+            2. Use PostgreSQL-specific SQL syntax
+            3. Ensure the query is optimized and efficient
+            4. Return only the raw SQL query
+            5. Include semicolons for each statement
+            6. If modifying data, include a SELECT to show results
 
-               SQL Query:
-               """)
+                       SQL Query:
+                       """)
 
-            db_type = "SQLite" if isinstance(self.connector, SQLiteConnector) else "PostgreSQL"
+            db_type = "SQLite" if isinstance(self.connector, SQLiteConnector) else "MySQL"
 
             chain = (
                     {
@@ -585,9 +642,7 @@ class LangChainDBApp:
                     | self.llm
                     | StrOutputParser()
             )
-
-
-
+            return chain
 
         elif isinstance(self.connector, MongoDBConnector):
 
@@ -663,37 +718,30 @@ class LangChainDBApp:
 
 
                MongoDB Query:
-
-               """)
+                """)
 
             chain = (
-
                     {
-
                         "schema": lambda _: self.connector.get_schema_info(),
-
                         "question": RunnablePassthrough()
-
                     }
-
                     | prompt
-
                     | self.llm
-
                     | StrOutputParser()
+                )
 
-            )
+            return chain
 
-        return chain
+        else:
+            raise ValueError("Unsupported database connector type")
 
     def _sanitize_query(self, query: str) -> str:
         """Remove markdown formatting and clean the query."""
         if not query:
             raise ValueError("Received empty query")
 
-        # Remove markdown code block syntax if present
-        query = query.replace('```sql', '').replace('```python', '').replace('```', '')
-        # Remove any leading/trailing whitespace
+        # Remove markdown code block syntax
+        query = query.replace('```sql', '').replace('```', '')
         query = query.strip()
 
         if not query:
@@ -707,12 +755,22 @@ class LangChainDBApp:
             raise ValueError("Question cannot be empty")
 
         try:
+            # Log the question and schema
+            schema_info = self.connector.get_schema_info()
+            print(f"Generating query for question: {question}")
+            print(f"Using schema: {schema_info}")
+
             generated_query = await self.query_chain.ainvoke(question)
+
+            # Log the generated query
+            print(f"Generated query: {generated_query}")
+
             if not generated_query:
                 raise ValueError("LLM returned empty query")
 
             return self._sanitize_query(generated_query)
         except Exception as e:
+            print(f"Error generating query: {str(e)}")
             raise Exception(f"Error generating query: {str(e)}")
 
     def execute_query(self, query: str) -> pd.DataFrame:
@@ -749,20 +807,20 @@ async def main():
     # Database selection
     db_type = st.sidebar.radio(
         "Choose your database type",
-        ["SQLite", "PostgreSQL (Neon DB)", "MongoDB Atlas"]
+        ["SQLite", "PostgreSQL", "MongoDB Atlas"]
     )
 
     # Database-specific configuration
     if db_type == "SQLite":
         db_path = st.sidebar.text_input("Database Path", "test.db")
         connection_params = db_path
-    elif db_type == "PostgreSQL (Neon DB)":
-        db_host = st.sidebar.text_input("Host", "ep-example.region.aws.neon.tech")
-        db_name = st.sidebar.text_input("Database Name", "neondb")
-        db_user = st.sidebar.text_input("Username", "neon_user")
-        db_password = st.sidebar.text_input("Password", type="password")
-        db_port = st.sidebar.text_input("Port", "5432")
-        connection_params = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+        # In the main function or configuration section
+    elif db_type == "PostgreSQL":
+        postgre_uri = st.sidebar.text_input(
+            "Neon DB connection String",
+            "postgresql://usernamee:password@ep-winter-mouse-a46bf40p.us-east-1.aws.neon.tech/neondb?sslmode=require"
+        )
+        connection_params = postgre_uri
     elif db_type == "MongoDB Atlas":
         mongo_uri = st.sidebar.text_input(
             "MongoDB Connection String",
@@ -788,8 +846,8 @@ async def main():
         # Create appropriate connector based on selected database type
         if db_type == "SQLite":
             connector = SQLiteConnector(connection_params)
-        elif db_type == "PostgreSQL (Neon DB)":
-            connector = PostgreSQLConnector(connection_params)
+        elif db_type == "PostgreSQL":
+            connector = NeonPostgresConnector(connection_params)
         elif db_type == "MongoDB Atlas":
             connector = MongoDBConnector(connection_params[0], connection_params[1])
 

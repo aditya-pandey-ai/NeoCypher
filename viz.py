@@ -10,7 +10,7 @@ from langchain_core.runnables import RunnablePassthrough
 from typing import Dict, Any, List, Optional
 import json
 from pydantic import BaseModel, Field, validator
-
+import os
 # Database Connectors
 import sqlite3
 import pymongo
@@ -37,94 +37,6 @@ class DatabaseConfig(BaseModel):
         if values.get('db_type') == 'mongodb' and not v:
             raise ValueError("Database name is required for MongoDB")
         return v
-
-
-def main():
-    st.set_page_config(page_title="Multi-Database Visualization", layout="wide")
-    st.title("Multi-Database Natural Language Visualization")
-
-    # Sidebar configuration
-    st.sidebar.title("Database Configuration")
-
-    # Database Type Selection
-    db_type = st.sidebar.selectbox(
-        "Select Database Type",
-        ['SQLite', 'MongoDB', 'PostgreSQL']
-    )
-
-    # Dynamic connection input based on database type
-    if db_type == 'SQLite':
-        connection_string = st.sidebar.text_input("SQLite Database Path", "path/to/database.db")
-        database_name = None
-    elif db_type == 'MongoDB':
-        connection_string = st.sidebar.text_input(
-            "MongoDB Connection String",
-            "mongodb+srv://username:password@cluster.mongodb.net/"
-        )
-        database_name = st.sidebar.text_input("Database Name", key="mongodb_db_name")
-    else:  # PostgreSQL
-        connection_string = st.sidebar.text_input(
-            "PostgreSQL Connection String",
-            "postgresql://username:password@host:port/database"
-        )
-        database_name = None
-
-    # GROQ API Key
-    groq_api_key = st.sidebar.text_input("GROQ API Key", type="password")
-
-    # Validate inputs
-    if not connection_string or not groq_api_key:
-        st.warning("Please provide connection details and GROQ API key")
-        return
-
-    # Create database configuration
-    try:
-        db_config = DatabaseConfig(
-            db_type=db_type.lower(),
-            connection_string=connection_string,
-            database_name=database_name
-        )
-
-        # Initialize app
-        app = VisualizationApp(db_config, groq_api_key)
-
-        # Main visualization interface
-        question = st.text_area(
-            "What would you like to visualize?",
-            placeholder="e.g., 'Show me a bar chart of total sales by month'"
-        )
-
-        if st.button("Generate Visualization"):
-            if question:
-                try:
-                    with st.spinner("Generating visualization..."):
-                        # Get visualization specification
-                        spec = app.get_visualization_spec(question)
-
-                        # Show the generated Query
-                        st.subheader("Generated Query")
-                        st.code(spec.sql_query, language="sql")
-
-                        # Execute query and get data
-                        data = app.db_connector.execute_query(spec.sql_query)
-
-                        # Show the data
-                        st.subheader("Data Preview")
-                        st.dataframe(data.head())
-
-                        # Create and display visualization
-                        st.subheader("Visualization")
-                        fig = app.create_visualization(spec, data)
-                        st.plotly_chart(fig, use_container_width=True)
-
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
-            else:
-                st.warning("Please enter a visualization request.")
-
-    except Exception as e:
-        st.error(f"Configuration Error: {str(e)}")
-
 
 class DatabaseConnector:
     """Unified database connection and querying interface"""
@@ -240,20 +152,89 @@ class DatabaseConnector:
                 return pd.read_sql_query(query, self.connection)
 
             elif self.config.db_type == 'mongodb':
-                # For MongoDB, attempt to parse query as aggregation pipeline
+
+                # Parse the query as a generic aggregation pipeline
+
                 try:
-                    # Attempt to parse as aggregation pipeline
-                    pipeline = json.loads(query)
-                    collection_name = pipeline[0].get('$match', {}).get('collection')
-                    if not collection_name:
-                        raise ValueError("MongoDB query must specify a collection")
+
+                    # Try to parse the query as a custom aggregation pipeline
+
+                    try:
+
+                        # Attempt to parse as JSON aggregation pipeline
+
+                        pipeline = json.loads(query)
+
+                    except json.JSONDecodeError:
+
+                        # If not JSON, try to dynamically generate pipeline
+
+                        # Extract collection and grouping logic from query
+
+                        import re
+
+                        # Extract collection name (assuming it's mentioned in the query)
+
+                        collection_match = re.search(r'FROM\s+(\w+)', query, re.IGNORECASE)
+
+                        if not collection_match:
+                            raise ValueError("Could not determine collection name")
+
+                        collection_name = collection_match.group(1)
+
+                        # Extract grouping column
+
+                        group_match = re.search(r'GROUP\s+BY\s+(\w+)', query, re.IGNORECASE)
+
+                        group_column = group_match.group(1) if group_match else None
+
+                        # Default aggregation pipeline
+
+                        pipeline = [
+
+                            {"$group": {
+
+                                "_id": f"${group_column}" if group_column else None,
+
+                                "count": {"$sum": 1}
+
+                            }},
+
+                            {"$project": {
+
+                                "group_key": "$_id",
+
+                                "count": 1,
+
+                                "_id": 0
+
+                            }}
+
+                        ]
+
+                    # Execute aggregation
 
                     collection = self.database[collection_name]
+
                     cursor = collection.aggregate(pipeline)
-                    return pd.DataFrame(list(cursor))
-                except json.JSONDecodeError:
-                    # Fallback to simple find query
-                    raise ValueError("Invalid MongoDB query format")
+
+                    # Convert to DataFrame
+
+                    result = pd.DataFrame(list(cursor))
+
+                    # Rename columns if needed
+
+                    if 'group_key' in result.columns:
+                        result = result.rename(columns={'group_key': group_column}) if group_column else result
+
+                    return result
+
+
+                except Exception as mongo_error:
+
+                    print(f"MongoDB query error: {mongo_error}")
+
+                    raise ValueError(f"Invalid MongoDB query: {mongo_error}")
 
             elif self.config.db_type == 'postgresql':
                 return pd.read_sql(query, self.connection)
@@ -270,18 +251,6 @@ class ChartSpec(BaseModel):
     color_column: Optional[str] = Field(None, description="Column name for color differentiation (optional)")
     aggregation: Optional[str] = Field(None, description="Aggregation function if needed (sum, avg, count)")
     sql_query: str = Field(..., description="Query to get the required data")
-class VisualizationApp:
-    def __init__(self, db_config: DatabaseConfig, groq_api_key: str):
-        self.db_connector = DatabaseConnector(db_config)
-        self.llm = ChatGroq(
-            api_key=groq_api_key,
-            model_name="llama-3.3-70b-versatile",
-            temperature=0.1
-        )
-        self.viz_chain = self._create_visualization_chain()
-
-    # ... (rest of the VisualizationApp remains the same)
-
 
 class VisualizationApp:
     def __init__(self, db_connector, groq_api_key: str):
@@ -366,60 +335,110 @@ class VisualizationApp:
 
     def create_visualization(self, spec: ChartSpec, data: pd.DataFrame):
         """Create and return a Plotly figure based on the specification."""
-        # Aggregation logic
-        if spec.aggregation:
-            agg_func = {
-                'avg': 'mean',
-                'average': 'mean',
-                'mean': 'mean',
-                'sum': 'sum',
-                'count': 'count',
-                'min': 'min',
-                'max': 'max'
-            }.get(spec.aggregation.lower(), 'mean')
+        # Debug print initial state
+        print("Initial Data Columns:", data.columns)
+        print("Spec Details:", spec.dict())
 
-            # Perform aggregation
-            data = data.groupby(spec.x_column)[spec.y_column].agg(agg_func).reset_index()
+        # Flexible column name matching
+        def find_column(target_column):
+            # Case-insensitive exact match
+            exact_matches = [col for col in data.columns if col.upper() == target_column.upper()]
+            if exact_matches:
+                return exact_matches[0]
 
-        # Visualization creation logic
+            # Partial match
+            partial_matches = [col for col in data.columns if target_column.upper() in col.upper()]
+            if partial_matches:
+                return partial_matches[0]
+
+            # If no match found
+            raise ValueError(f"Cannot find column matching: {target_column}. Available columns: {list(data.columns)}")
+
         try:
+            # Validate and find correct column names
+            x_column = find_column(spec.x_column)
+            y_column = find_column(spec.y_column)
+
+            data[y_column] = pd.to_numeric(data[y_column], errors='coerce')
+
+            # Aggregation logic with error handling
+            if spec.aggregation:
+                agg_func = {
+                    'avg': 'mean',
+                    'average': 'mean',
+                    'mean': 'mean',
+                    'sum': 'sum',
+                    'count': 'count',
+                    'min': 'min',
+                    'max': 'max'
+                }.get(spec.aggregation.lower(), 'mean')
+
+                try:
+                    # Perform aggregation
+                    data = data.groupby(x_column)[y_column].agg(agg_func).reset_index()
+                except Exception as agg_error:
+                    print(f"Aggregation error: {agg_error}")
+                    # Fallback to original data if aggregation fails
+
+            # Ensure columns are of appropriate type
+            try:
+                data[x_column] = data[x_column].astype(str)
+                data[y_column] = pd.to_numeric(data[y_column], errors='coerce')
+            except Exception as type_error:
+                print(f"Type conversion error: {type_error}")
+
+            # Color column handling
+            color_column = None
+            if spec.color_column:
+                try:
+                    color_column = find_column(spec.color_column)
+                except ValueError:
+                    print(f"Could not find color column: {spec.color_column}")
+                    color_column = None
+
+            # Visualization creation logic with enhanced error handling
             if spec.chart_type == "bar":
                 fig = px.bar(
                     data,
-                    x=spec.x_column,
-                    y=spec.y_column,
-                    color=spec.color_column,
+                    x=x_column,
+                    y=y_column,
+                    color=color_column,
                     title=spec.title
                 )
             elif spec.chart_type == "line":
                 fig = px.line(
                     data,
-                    x=spec.x_column,
-                    y=spec.y_column,
-                    color=spec.color_column,
+                    x=x_column,
+                    y=y_column,
+                    color=color_column,
                     title=spec.title
                 )
             elif spec.chart_type == "pie":
                 fig = px.pie(
                     data,
-                    names=spec.x_column,
-                    values=spec.y_column,
+                    names=x_column,
+                    values=y_column,
                     title=spec.title
                 )
+                fig.update_traces(texttemplate='%{label}<br>%{value} (%{percent})')
             elif spec.chart_type == "scatter":
                 fig = px.scatter(
                     data,
-                    x=spec.x_column,
-                    y=spec.y_column,
-                    color=spec.color_column,
+                    x=x_column,
+                    y=y_column,
+                    color=color_column,
                     title=spec.title
                 )
             else:
                 raise ValueError(f"Unsupported chart type: {spec.chart_type}")
 
             return fig
+
         except Exception as e:
             print(f"Visualization creation error: {e}")
+            # Provide more context about the error
+            print(f"Data columns: {list(data.columns)}")
+            print(f"Spec details: {spec.dict()}")
             raise
 
 
@@ -454,8 +473,11 @@ def main():
         database_name = None
 
     # GROQ API Key
-    groq_api_key = st.sidebar.text_input("GROQ API Key", type="password")
-
+    groq_api_key = st.sidebar.text_input(
+        "GROQ API Key",
+        value=os.getenv("GROQ_API_KEY", ""),
+        type="password"
+    )
     # Validate inputs
     if not connection_string or not groq_api_key:
         st.warning("Please provide connection details and GROQ API key")
